@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Icarus launcher — no venv, no install step; stdlib + PyYAML only.
+# Deliberately does NOT cd: tools default to the caller's working directory,
+# so `icarus "fix this test"` operates on the repo you're standing in.
+ICARUS_ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+export PYTHONPATH="$ICARUS_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m icarus "$@"
