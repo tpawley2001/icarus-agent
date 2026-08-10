@@ -368,7 +368,18 @@ icarus/
   usage.py      optional token-usage stats writer
   render.py     ANSI output, spinner with elapsed clock
   tools/        registry + the ten built-ins
+tests/          regression tests — stdlib only, no runner needed
 ```
+
+## Tests
+
+```bash
+python3 tests/test_loop_and_context.py
+```
+
+No dependencies and no test runner, same as the tool itself. The suite drives
+the real agent loop with a stub model that repeats itself, and covers the
+tool-repetition breaker and the compaction rules described above.
 
 ## Further reading
 

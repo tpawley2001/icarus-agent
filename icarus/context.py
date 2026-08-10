@@ -76,16 +76,112 @@ def _chars(messages: List[Dict[str, Any]]) -> int:
 
 
 def trim_tool_output(text: str, max_chars: int) -> str:
-    """Middle-out truncation — the head and tail of output carry the meaning."""
+    """Middle-out truncation — the head and tail of output carry the meaning.
+
+    Line-oriented output (directory listings, search hits, grep results) is cut
+    on line boundaries and the marker names how many *entries* went missing.
+    That wording is load-bearing: a listing clamped to a few hundred characters
+    physically cannot hold 300 names, so the only safe outcome is that the
+    model knows entries were dropped and re-queries more narrowly. A silent
+    mid-list character cut reads as a complete listing, and the agent then
+    concludes a directory it never saw does not exist.
+    """
     if len(text) <= max_chars:
         return text
-    keep = max_chars // 2 - 40
+
+    lines = text.split("\n")
+    if len(lines) >= 4:
+        trimmed = _trim_lines(lines, max_chars)
+        if trimmed is not None:
+            return trimmed
+
+    keep = max(1, max_chars // 2 - 40)
     dropped = len(text) - 2 * keep
     return (
         text[:keep]
         + f"\n\n... [{dropped:,} characters elided by icarus] ...\n\n"
         + text[-keep:]
     )
+
+
+def _trim_lines(lines: List[str], max_chars: int) -> Optional[str]:
+    """Drop whole lines from the middle, keeping head and tail balanced.
+
+    Returns None if even a minimal head+tail will not fit, leaving the caller
+    to fall back to a plain character cut.
+    """
+    head: List[str] = []
+    tail: List[str] = []
+    used = 0
+    # Reserve enough for the marker itself, or the "trimmed" result comes back
+    # over budget and the compaction sweep thinks it made progress when it did
+    # not. Sized against the longest form the marker can take.
+    marker_budget = 200
+    lo, hi = 0, len(lines) - 1
+    take_head = True
+
+    while lo <= hi:
+        idx = lo if take_head else hi
+        cost = len(lines[idx]) + 1
+        if used + cost > max_chars - marker_budget:
+            break
+        (head if take_head else tail).append(lines[idx])
+        used += cost
+        if take_head:
+            lo += 1
+        else:
+            hi -= 1
+        take_head = not take_head
+
+    elided = hi - lo + 1
+    if elided <= 0:
+        return "\n".join(lines)
+    if not head and not tail:
+        return None
+
+    marker = (
+        f"... [{elided:,} of {len(lines):,} lines elided by icarus — they are NOT "
+        f"absent, only hidden; re-run with a narrower path or filter to see them] ..."
+    )
+    return "\n".join(head + [marker] + list(reversed(tail)))
+
+
+# Tool results are squeezed in two sweeps, oldest first, stopping the moment
+# the budget is met. The soft clamp is deliberately roomy: a directory listing
+# or a search hit-list trimmed middle-out to a few hundred characters loses its
+# middle entries entirely, and the agent then cannot see a path it already
+# looked up. Only if the soft sweep is not enough do we fall to the hard clamp.
+TOOL_CLAMP_SOFT = 2000
+TOOL_CLAMP_HARD = 400
+
+
+def _squeeze_oldest_first(
+    head: List[Dict[str, Any]],
+    system: List[Dict[str, Any]],
+    tail: List[Dict[str, Any]],
+    budget: Budget,
+    clamp: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Trim old tool results one at a time until the budget is met.
+
+    Clamping *every* old result at once throws away far more than the budget
+    asked for, so this re-checks after each one and stops early. Oldest first,
+    because the most recent results are the ones still being reasoned about.
+    """
+    out = list(head)
+    trimmed = 0
+    for i, m in enumerate(out):
+        if budget.estimate(system + out + tail) <= budget.limit:
+            break
+        if m.get("role") != "tool" or not isinstance(m.get("content"), str):
+            continue
+        if len(m["content"]) <= clamp:
+            continue
+        m = dict(m)
+        m["content"] = trim_tool_output(m["content"], clamp)
+        out[i] = m
+        trimmed += 1
+    return out, trimmed
 
 
 def compact(
@@ -98,12 +194,15 @@ def compact(
 
     Strategy, cheapest first:
       1. Always keep the system prompt and the last `keep_recent` messages.
-      2. Squeeze old tool results, which dominate token count in agent traces.
+      2. Squeeze old tool results, which dominate token count in agent traces —
+         gently first, then hard, and only as far as the budget requires.
       3. If still over, summarize the middle via `summarize` (a callable taking
          messages and returning text). Falls back to dropping if unavailable.
 
     Returns (new_messages, note) where note describes what happened, or None if
-    nothing was needed.
+    nothing was needed. The input messages are never mutated: callers that keep
+    the full history (see Agent.run_turn) can compact per request and still
+    retain everything the agent has actually seen.
     """
     if budget.estimate(messages) <= budget.limit:
         return messages, None
@@ -115,18 +214,21 @@ def compact(
 
     head, tail = rest[:-keep_recent], rest[-keep_recent:]
 
-    # Pass 1 — clamp old tool results hard. They are the bulk of the tokens and
-    # the least useful once the agent has moved on.
-    squeezed = []
-    for m in head:
-        if m.get("role") == "tool" and isinstance(m.get("content"), str):
-            m = dict(m)
-            m["content"] = trim_tool_output(m["content"], 400)
-        squeezed.append(m)
+    # Pass 1 — squeeze old tool results, gently, then harder if that missed.
+    # A message trimmed by both sweeps must only be counted once, so the note
+    # counts messages that actually changed rather than summing sweep totals.
+    def _changed(after: List[Dict[str, Any]]) -> int:
+        return sum(1 for before, now in zip(head, after) if before is not now)
 
+    squeezed, _ = _squeeze_oldest_first(head, system, tail, budget, TOOL_CLAMP_SOFT)
     candidate = system + squeezed + tail
     if budget.estimate(candidate) <= budget.limit:
-        return candidate, f"compacted: trimmed {len(squeezed)} older tool results"
+        return candidate, f"compacted: trimmed {_changed(squeezed)} older tool result(s)"
+
+    squeezed, _ = _squeeze_oldest_first(squeezed, system, tail, budget, TOOL_CLAMP_HARD)
+    candidate = system + squeezed + tail
+    if budget.estimate(candidate) <= budget.limit:
+        return candidate, f"compacted: trimmed {_changed(squeezed)} older tool result(s)"
 
     # Pass 2 — summarize the middle.
     if summarize is not None:

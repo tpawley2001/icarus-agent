@@ -15,11 +15,12 @@ Two things here exist because the models are local:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import protocol, usage
 from .caps import Caps, CapsStore, ensure as ensure_caps
@@ -43,6 +44,35 @@ Working directory: {workdir}
 Today is {date}."""
 
 
+# How many times the same tool call may come back with a byte-identical result
+# before the turn is abandoned. Small models fall into repetition attractors:
+# an identical (call, result) pair appended to the context makes the next
+# identical call *more* likely, so the trace can only be broken from outside.
+MAX_IDENTICAL_REPEATS = 3
+
+REPEAT_NUDGE = (
+    "[icarus] You already made this exact call with these exact arguments, and "
+    "the result is byte-for-byte identical to the one above. Repeating it "
+    "cannot tell you anything new. Change the tool or the arguments — look "
+    "somewhere you have not looked yet — or stop and tell the user what you "
+    "found and what is blocking you."
+)
+
+
+def _call_signature(name: str, raw_args: Any) -> str:
+    """Stable key for a tool call, insensitive to key order and whitespace."""
+    try:
+        parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        args = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    except (json.JSONDecodeError, TypeError):
+        args = str(raw_args)
+    return f"{name}({args})"
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
 @dataclass
 class TurnStats:
     iterations: int = 0
@@ -53,6 +83,8 @@ class TurnStats:
     compactions: List[str] = field(default_factory=list)
     interrupted: bool = False
     steered: int = 0
+    repeated_calls: int = 0
+    looped: bool = False
 
 
 @dataclass
@@ -171,13 +203,12 @@ class Agent:
             notes.append("thinking forced ON (model returns empty output otherwise)")
 
         # The new model may have a smaller window than the conversation needs.
+        # Say so, but don't shrink the stored history to fit: run_turn compacts
+        # per request against the current budget, so switching to a small model
+        # and back no longer costs the conversation anything permanently.
         budget = self._budget()
         if budget.estimate(self.session.messages) > budget.limit:
-            self.session.messages, note = compact(
-                self.session.messages, budget, summarize=self._summarize
-            )
-            if note:
-                notes.append(note)
+            notes.append("history exceeds the new window; it will be compacted per request")
         return f"Switched {old or '(none)'} → {new_model}: " + ", ".join(notes)
 
     # ---- context --------------------------------------------------------
@@ -228,6 +259,12 @@ class Agent:
         stream = bool(acfg.get("stream", True)) and self.on_text is not None
         budget = self._budget()
 
+        # Signature -> (digest of the last result, consecutive identical repeats).
+        # Scoped to the turn: repeating a lookup in a later turn is legitimate,
+        # since the file or directory may well have changed by then.
+        seen_calls: Dict[str, Tuple[str, int]] = {}
+        looping = False
+
         for _ in range(max_iter):
             stats.iterations += 1
 
@@ -238,7 +275,12 @@ class Agent:
             if self._check_abort(stats):
                 break
 
-            self.session.messages, note = compact(
+            # Compaction shapes THIS request only — the session keeps the full
+            # history. Writing the squeezed copy back used to destroy the
+            # originals permanently, so a tool result that got clamped early
+            # (a directory listing, say) could never be consulted again even
+            # after later messages fell out of the window.
+            history, note = compact(
                 self.session.messages, budget, summarize=self._summarize
             )
             if note:
@@ -246,7 +288,7 @@ class Agent:
                 if self.on_status:
                     self.on_status(note)
 
-            messages = [{"role": "system", "content": self.system_prompt()}] + self.session.messages
+            messages = [{"role": "system", "content": self.system_prompt()}] + history
             tools = self._schemas() if self.caps.native_tools else None
 
             try:
@@ -326,6 +368,15 @@ class Agent:
                     )
                     stats.interrupted = True
                     continue
+                if looping:
+                    # Every tool_call in the batch still needs a reply or the
+                    # next request is malformed, so answer the rest cheaply.
+                    self.session.messages.append(
+                        {"role": "tool", "tool_call_id": call.get("id", ""),
+                         "name": (call.get("function") or {}).get("name", ""),
+                         "content": "[skipped — turn stopped: repeated tool call]"}
+                    )
+                    continue
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 raw_args = fn.get("arguments") or "{}"
@@ -341,6 +392,30 @@ class Agent:
                 if self.on_tool_end:
                     self.on_tool_end(name, result)
 
+                # Same call, same bytes back? Appending the duplicate would only
+                # reinforce the repetition — send a nudge in its place, and give
+                # up on the turn if the nudge keeps not landing.
+                sig = _call_signature(name, raw_args)
+                digest = _digest(result.content)
+                prev_digest, repeats = seen_calls.get(sig, ("", 0))
+                repeats = repeats + 1 if digest == prev_digest else 0
+                seen_calls[sig] = (digest, repeats)
+
+                if repeats:
+                    stats.repeated_calls += 1
+                    self.session.messages.append(
+                        {"role": "tool", "tool_call_id": call.get("id", ""),
+                         "name": name, "content": REPEAT_NUDGE}
+                    )
+                    if repeats >= MAX_IDENTICAL_REPEATS:
+                        looping = True
+                        stats.looped = True
+                        if self.on_status:
+                            self.on_status(
+                                f"stopped: {name} repeated with identical results"
+                            )
+                    continue
+
                 self.session.messages.append(
                     {
                         "role": "tool",
@@ -352,6 +427,14 @@ class Agent:
                         ),
                     }
                 )
+
+            if looping:
+                self.session.messages.append(
+                    {"role": "assistant",
+                     "content": "[icarus stopped this turn: the same tool call kept "
+                                "returning identical results]"}
+                )
+                break
         else:
             if self.on_status:
                 self.on_status(f"stopped at the {max_iter}-iteration cap")
