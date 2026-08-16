@@ -59,6 +59,33 @@ REPEAT_NUDGE = (
 )
 
 
+# A served prompt can overflow the window even after per-request compaction,
+# because compaction protects the most recent messages and works off a token
+# *estimate* that a wall of dense paths under-counts. When the server rejects
+# the prompt outright we know the estimate was wrong, so we hard-trim stored
+# tool output and retry rather than losing the turn. These substrings are what
+# llama.cpp / llama-swap put in the 4xx/5xx body for that condition.
+CONTEXT_OVERFLOW_MARKERS = (
+    "context size has been exceeded",
+    "exceeds the context",
+    "exceed the context",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "too many tokens",
+    "n_ctx",
+    "kv cache",
+)
+
+# How many emergency shrink+retry passes to make before giving up the turn.
+MAX_OVERFLOW_SHRINKS = 2
+
+
+def _is_context_overflow(err: str) -> bool:
+    low = err.lower()
+    return any(m in low for m in CONTEXT_OVERFLOW_MARKERS)
+
+
 def _call_signature(name: str, raw_args: Any) -> str:
     """Stable key for a tool call, insensitive to key order and whitespace."""
     try:
@@ -220,6 +247,27 @@ class Agent:
             threshold=float(acfg.get("context_threshold", 0.75)),
         )
 
+    def _emergency_shrink(self, clamp: int = 800) -> int:
+        """Hard-trim tool results in the *stored* history, in place.
+
+        Called only after the server has actually rejected a prompt for context
+        overflow — meaning the estimate was too optimistic and normal
+        compaction (which shields the most recent `keep_recent` messages)
+        could not rescue the turn. Tool dumps are the usual culprit: a
+        recursive listing or a search that returned a wall of paths. Almost
+        none of that bulk is worth keeping verbatim, and clamping it in the
+        stored history (not just per request) stops the same bloat from
+        re-overflowing every following turn. Returns how many were trimmed.
+        """
+        trimmed = 0
+        for m in self.session.messages:
+            if (m.get("role") == "tool"
+                    and isinstance(m.get("content"), str)
+                    and len(m["content"]) > clamp):
+                m["content"] = trim_tool_output(m["content"], clamp)
+                trimmed += 1
+        return trimmed
+
     def _summarize(self, messages: List[Dict[str, Any]]) -> str:
         """Ask the model to compress its own earlier history."""
         transcript = []
@@ -275,40 +323,63 @@ class Agent:
             if self._check_abort(stats):
                 break
 
-            # Compaction shapes THIS request only — the session keeps the full
-            # history. Writing the squeezed copy back used to destroy the
-            # originals permanently, so a tool result that got clamped early
-            # (a directory listing, say) could never be consulted again even
-            # after later messages fell out of the window.
-            history, note = compact(
-                self.session.messages, budget, summarize=self._summarize
-            )
-            if note:
-                stats.compactions.append(note)
-                if self.on_status:
-                    self.on_status(note)
-
-            messages = [{"role": "system", "content": self.system_prompt()}] + history
-            tools = self._schemas() if self.caps.native_tools else None
-
-            try:
-                reply = self.client.complete(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=float(mcfg.get("temperature", 0.2)),
-                    top_p=float(mcfg.get("top_p", 0.95)),
-                    max_tokens=int(mcfg.get("max_tokens", 4096)),
-                    stream=stream,
-                    on_token=self.on_text if stream else None,
-                    should_abort=(self.watcher.aborted if self.watcher else None),
+            # Model call with context-overflow recovery. Compaction shapes
+            # THIS request only — the session keeps the full history. Writing
+            # the squeezed copy back used to destroy the originals permanently,
+            # so a tool result that got clamped early (a directory listing, say)
+            # could never be consulted again even after later messages fell out
+            # of the window. If the server still rejects the prompt for overflow,
+            # the estimate was wrong: hard-trim stored tool output, bias the
+            # budget pessimistic so the next pass cuts harder, and retry.
+            reply = None
+            model_error: Optional[str] = None
+            for shrink_try in range(MAX_OVERFLOW_SHRINKS + 1):
+                history, note = compact(
+                    self.session.messages, budget, summarize=self._summarize
                 )
-            except LLMError as e:
+                if note:
+                    stats.compactions.append(note)
+                    if self.on_status:
+                        self.on_status(note)
+
+                messages = [{"role": "system", "content": self.system_prompt()}] + history
+                tools = self._schemas() if self.caps.native_tools else None
+
+                try:
+                    reply = self.client.complete(
+                        model=self.model,
+                        messages=messages,
+                        tools=tools,
+                        temperature=float(mcfg.get("temperature", 0.2)),
+                        top_p=float(mcfg.get("top_p", 0.95)),
+                        max_tokens=int(mcfg.get("max_tokens", 4096)),
+                        stream=stream,
+                        on_token=self.on_text if stream else None,
+                        should_abort=(self.watcher.aborted if self.watcher else None),
+                    )
+                    break
+                except LLMError as e:
+                    if _is_context_overflow(str(e)) and shrink_try < MAX_OVERFLOW_SHRINKS:
+                        trimmed = self._emergency_shrink()
+                        # The estimate under-counted; make it pessimistic so the
+                        # next compaction pass trims (and drops) far more.
+                        budget.chars_per_token = max(1.5, budget.chars_per_token * 0.6)
+                        stats.compactions.append("emergency context-overflow shrink")
+                        if self.on_status:
+                            self.on_status(
+                                f"context overflow — hard-trimmed {trimmed} tool "
+                                "result(s), retrying"
+                            )
+                        continue
+                    model_error = str(e)
+                    break
+
+            if reply is None:
                 self.session.messages.append(
-                    {"role": "assistant", "content": f"[model error: {e}]"}
+                    {"role": "assistant", "content": f"[model error: {model_error}]"}
                 )
                 if self.on_status:
-                    self.on_status(f"error: {e}")
+                    self.on_status(f"error: {model_error}")
                 break
 
             stats.prompt_tokens += reply.prompt_tokens

@@ -39,8 +39,13 @@ from icarus.context import (  # noqa: E402
     compact,
     trim_tool_output,
 )
-from icarus.llm import Reply  # noqa: E402
-from icarus.loop import MAX_IDENTICAL_REPEATS, REPEAT_NUDGE, Agent  # noqa: E402
+from icarus.llm import LLMError, Reply  # noqa: E402
+from icarus.loop import (  # noqa: E402
+    MAX_IDENTICAL_REPEATS,
+    REPEAT_NUDGE,
+    Agent,
+    _is_context_overflow,
+)
 from icarus.session import Session  # noqa: E402
 from icarus.tools.registry import Registry, ToolResult  # noqa: E402
 
@@ -229,6 +234,107 @@ for _ in range(5000):
     elif len(result) > clamp:
         over += 1
 check("no over-budget or altered results in 5000 cases", over == 0, f"{over} bad")
+
+section("[8] a served context-overflow is recovered, not fatal")
+
+# The exact body llama-swap returned in the real incident, plus a few phrasings
+# llama.cpp uses, must all be recognised as overflow (and unrelated 5xx must not).
+check("recognises the incident's error body", _is_context_overflow(
+    'HTTP 500 from model server: {"error":{"code":500,'
+    '"message":"Context size has been exceeded.","type":"server_error"}}'))
+check("recognises llama.cpp n_ctx phrasing",
+      _is_context_overflow("the request exceeds the available n_ctx"))
+check("does not mistake an unrelated 5xx for overflow",
+      not _is_context_overflow("HTTP 500: upstream command exited prematurely"))
+
+
+class OverflowThenClient:
+    """Rejects the first N prompts for context overflow, then answers.
+
+    Mirrors the incident: a giant tool result has bloated the history, the
+    server rejects the prompt, and the loop must shrink and retry rather than
+    give up. Records the largest tool message it was handed each call, so the
+    test can prove the retry prompt actually shrank.
+    """
+
+    def __init__(self, reject_times: int) -> None:
+        self.disable_thinking = False
+        self.reject_times = reject_times
+        self.calls = 0
+        self.biggest_tool_chars: list = []
+
+    def complete(self, model, messages, **kw):  # noqa: ANN001
+        self.calls += 1
+        self.biggest_tool_chars.append(max(
+            (len(m.get("content") or "") for m in messages if m.get("role") == "tool"),
+            default=0,
+        ))
+        if self.calls <= self.reject_times:
+            raise LLMError(
+                'HTTP 500 from model server: '
+                '{"error":{"message":"Context size has been exceeded."}}'
+            )
+        return Reply(content="done", prompt_tokens=100, completion_tokens=5)
+
+
+agent = build_agent(OverflowThenClient(reject_times=1), lambda k: "")
+# Seed history with a huge tool dump — the kind a $HOME-wide search produced.
+agent.session.messages.append({"role": "user", "content": "find the scraper"})
+agent.session.messages.append(
+    {"role": "tool", "tool_call_id": "c0", "name": "search_files",
+     "content": "\n".join(f"/home/tyson/.cache/junk/file{i}.py:1:x" for i in range(4000))}
+)
+huge_before = len(agent.session.messages[-1]["content"])
+stats = agent.run_turn("continue")
+
+last = agent.session.messages[-1]
+check("the turn recovered and produced an answer",
+      last.get("role") == "assistant" and last.get("content") == "done")
+check("no [model error] was recorded",
+      not any("[model error" in str(m.get("content")) for m in agent.session.messages))
+check("an emergency shrink was noted",
+      any("context-overflow" in n for n in stats.compactions))
+check("the bloated tool dump was hard-trimmed in stored history",
+      len(agent.session.messages[1]["content"]) < huge_before)
+check("the retry prompt was smaller than the one that overflowed",
+      agent.client.biggest_tool_chars[1] < agent.client.biggest_tool_chars[0],
+      f"{agent.client.biggest_tool_chars}")
+
+# When the server never stops rejecting, the turn ends cleanly with an error,
+# not an exception or a hang.
+agent2 = build_agent(OverflowThenClient(reject_times=99), lambda k: "")
+agent2.session.messages.append(
+    {"role": "tool", "tool_call_id": "c0", "name": "search_files",
+     "content": "x" * 200_000}
+)
+stats2 = agent2.run_turn("go")
+check("unrecoverable overflow degrades to a recorded model error",
+      any("[model error" in str(m.get("content")) for m in agent2.session.messages))
+check("it stopped retrying rather than looping forever",
+      agent2.client.calls <= 3, f"{agent2.client.calls} calls")
+
+
+section("[9] search excludes dependency/cache trees")
+from icarus.tools import builtin  # noqa: E402
+
+sandbox = _TMP / "search_sandbox"
+(sandbox / "src").mkdir(parents=True)
+(sandbox / "node_modules" / "pkg").mkdir(parents=True)
+(sandbox / ".cache" / "uv").mkdir(parents=True)
+(sandbox / "src" / "app.py").write_text("import needle\n")
+(sandbox / "node_modules" / "pkg" / "index.js").write_text("var needle = 1\n")
+(sandbox / ".cache" / "uv" / "x.py").write_text("needle = 2\n")
+
+reg = builtin.build(workdir=sandbox)
+hits = reg.dispatch("search_files", json.dumps({"pattern": "needle", "path": str(sandbox)}))
+check("finds the real source hit", "src/app.py" in hits.content)
+check("excludes node_modules", "node_modules" not in hits.content)
+check("excludes hidden cache dirs", "/.cache/" not in hits.content)
+
+globbed = reg.dispatch("glob_files", json.dumps({"pattern": "**/*.py", "path": str(sandbox)}))
+check("glob finds the source file", "src/app.py" in globbed.content)
+check("glob excludes cache trees", "/.cache/" not in globbed.content)
+
 
 # --------------------------------------------------------------------------
 shutil.rmtree(_TMP, ignore_errors=True)

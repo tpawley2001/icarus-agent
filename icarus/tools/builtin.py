@@ -21,6 +21,22 @@ from .registry import Registry, ToolResult
 
 MAX_READ_BYTES = 400_000
 
+# Directories that are pure noise for a code search: dependency trees, build
+# output, package caches, VCS internals. Excluded from search_files/glob_files
+# so a search rooted at $HOME (or any dir with a vendored tree under it) does
+# not drown the model's small context in cache and site-package paths — the
+# failure that made a single search flood a 32K window past its limit.
+IGNORE_DIRS = frozenset({
+    ".git", ".hg", ".svn",
+    "node_modules", "bower_components", "vendor",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    "venv", ".venv", "virtualenv", "site-packages", ".eggs",
+    ".cache", ".bun", ".npm", ".pnpm-store", ".yarn",
+    ".cargo", ".rustup", ".gradle", ".m2",
+    "dist", "build", "target", ".next", ".nuxt", ".svelte-kit", ".parcel-cache",
+    ".idea", ".vscode", ".terraform",
+})
+
 
 def _kill_group(proc) -> None:
     """SIGTERM then SIGKILL the whole process group."""
@@ -304,7 +320,13 @@ def build(
         limit = int(max_results or 100)
         rg = shutil.which("rg")
         if rg:
-            cmd = [rg, "--line-number", "--no-heading", "--color=never", "-m", str(limit)]
+            # --max-columns keeps a single minified line (a bundled JS file can
+            # run thousands of chars) from swamping the result; the preview flag
+            # keeps such a hit visible as a stub rather than dropping it.
+            cmd = [rg, "--line-number", "--no-heading", "--color=never",
+                   "--max-columns", "300", "--max-columns-preview", "-m", str(limit)]
+            for d in IGNORE_DIRS:
+                cmd += ["-g", f"!{d}"]
             if glob:
                 cmd += ["--glob", glob]
             cmd += ["-e", pattern, str(root)]
@@ -320,8 +342,10 @@ def build(
                 return ToolResult(False, f"Invalid regex: {e}", "search_files: bad regex")
             hits = []
             for dirpath, dirnames, filenames in os.walk(root):
-                dirnames[:] = [d for d in dirnames if d not in
-                               {".git", "node_modules", "__pycache__", "venv", ".next"}]
+                # Prune noise dirs and hidden trees in place so os.walk never
+                # descends into them — matching ripgrep's default reach.
+                dirnames[:] = [d for d in dirnames
+                               if d not in IGNORE_DIRS and not d.startswith(".")]
                 for fn in filenames:
                     if glob and not fnmatch.fnmatch(fn, glob):
                         continue
@@ -356,7 +380,18 @@ def build(
     def glob_files(pattern: str, path: str = ".") -> ToolResult:
         root = resolve(path)
         try:
-            found = [str(p) for p in sorted(root.glob(pattern)) if p.is_file()][:300]
+            found = []
+            for p in sorted(root.glob(pattern)):
+                if not p.is_file():
+                    continue
+                # Skip anything living under a dependency/build/cache tree, the
+                # same noise search_files excludes; an explicit pattern reaching
+                # into one is honoured (the pattern itself names the dir).
+                if set(p.parts) & IGNORE_DIRS:
+                    continue
+                found.append(str(p))
+                if len(found) >= 300:
+                    break
         except Exception as e:
             return ToolResult(False, f"Bad glob: {e}", "glob_files: error")
         if not found:
