@@ -80,10 +80,27 @@ CONTEXT_OVERFLOW_MARKERS = (
 # How many emergency shrink+retry passes to make before giving up the turn.
 MAX_OVERFLOW_SHRINKS = 2
 
+# A model that cannot be served at all — a GGUF llama-server refuses to load, or
+# a name llama-swap has no entry for. Retrying is pointless: every turn fails
+# identically until the user picks a different model, so say that instead of
+# echoing the raw upstream JSON back at them.
+DEAD_MODEL_MARKERS = (
+    "exited prematurely",
+    "no router for requested model",
+    "failed to load model",
+    "error loading model",
+    "unknown model",
+)
+
 
 def _is_context_overflow(err: str) -> bool:
     low = err.lower()
     return any(m in low for m in CONTEXT_OVERFLOW_MARKERS)
+
+
+def _is_dead_model(err: str) -> bool:
+    low = err.lower()
+    return any(m in low for m in DEAD_MODEL_MARKERS)
 
 
 def _call_signature(name: str, raw_args: Any) -> str:
@@ -372,6 +389,12 @@ class Agent:
                             )
                         continue
                     model_error = str(e)
+                    if _is_dead_model(model_error):
+                        model_error = (
+                            f"model {self.model!r} cannot be served ({model_error}) "
+                            f"— every turn will fail this way until you switch; "
+                            f"use /model to pick another"
+                        )
                     break
 
             if reply is None:

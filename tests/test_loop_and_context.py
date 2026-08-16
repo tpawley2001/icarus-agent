@@ -45,6 +45,7 @@ from icarus.loop import (  # noqa: E402
     REPEAT_NUDGE,
     Agent,
     _is_context_overflow,
+    _is_dead_model,
 )
 from icarus.session import Session  # noqa: E402
 from icarus.tools.registry import Registry, ToolResult  # noqa: E402
@@ -334,6 +335,57 @@ check("excludes hidden cache dirs", "/.cache/" not in hits.content)
 globbed = reg.dispatch("glob_files", json.dumps({"pattern": "**/*.py", "path": str(sandbox)}))
 check("glob finds the source file", "src/app.py" in globbed.content)
 check("glob excludes cache trees", "/.cache/" not in globbed.content)
+
+
+# --------------------------------------------------------------------------
+section("[10] an unloadable model reports actionably instead of raw JSON")
+
+# The body llama-swap returns when llama-server dies at load (the incident:
+# huihui_ai/gemma-4-abliterated:latest, a 2131-tensor Gemma-4n MatFormer export
+# this build cannot construct), plus the name-not-in-config case.
+check("recognises an upstream that died at load", _is_dead_model(
+    'HTTP 500 from model server: {"src":"llama-swap", '
+    '"error": "unspecific error: upstream command exited prematurely"}'))
+check("recognises an unknown model name", _is_dead_model(
+    'HTTP 500 from model server: {"src":"llama-swap", '
+    '"error": "no router for requested model"}'))
+check("recognises llama.cpp's own load failure",
+      _is_dead_model("error loading model: done_getting_tensors: wrong number "
+                     "of tensors; expected 2131, got 720"))
+check("does not mistake a context overflow for a dead model",
+      not _is_dead_model("Context size has been exceeded."))
+check("does not mistake an ordinary refusal for a dead model",
+      not _is_dead_model("I can't help with that."))
+
+
+class DeadModelClient:
+    """Every call fails the way an unloadable model does."""
+
+    def __init__(self) -> None:
+        self.disable_thinking = False
+        self.calls = 0
+
+    def complete(self, model, messages, **kw):  # noqa: ANN001
+        self.calls += 1
+        raise LLMError(
+            'HTTP 500 from model server: {"src":"llama-swap", '
+            '"error": "unspecific error: upstream command exited prematurely"}'
+        )
+
+
+client = DeadModelClient()
+agent = build_agent(client, lambda k: "")
+agent.model = "huihui_ai/gemma-4-abliterated:latest"
+agent.run_turn("how might I build a news app?")
+
+recorded = str(agent.session.messages[-1].get("content"))
+check("the turn is not silently lost", "[model error" in recorded)
+check("the dead model is named", "gemma-4-abliterated" in recorded)
+check("the user is told how to recover", "/model" in recorded)
+check("the raw upstream body is preserved for debugging",
+      "exited prematurely" in recorded)
+check("it does not hammer the dead upstream", client.calls <= 2,
+      f"{client.calls} calls")
 
 
 # --------------------------------------------------------------------------
