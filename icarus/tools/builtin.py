@@ -107,7 +107,8 @@ def build(
         try:
             proc = subprocess.Popen(
                 command, shell=True, cwd=str(run_in),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True, start_new_session=True,
             )
         except Exception as e:

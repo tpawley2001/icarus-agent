@@ -151,10 +151,26 @@ def build_agent(
         console.say()
         console.say(console.style.yellow("  ⚠ This command needs your approval:"))
         console.say(console.style.bold(f"    {command}"))
+        # input() runs while the turn is in flight, i.e. while the raw-mode
+        # watcher thread is also reading stdin. Two readers on one tty fd steal
+        # each other's keystrokes, so stop the watcher (restores cooked mode and
+        # blocking stdin) for the duration of the prompt and resume after.
+        watcher = console.watcher
+        was_running = bool(
+            watcher is not None
+            and watcher.enabled
+            and watcher._thread is not None
+            and watcher._thread.is_alive()
+        )
+        if was_running:
+            watcher.stop()
         try:
             ans = input(console.style.yellow("    Run it? [y]es / [n]o / [a]lways this kind: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
+        finally:
+            if was_running:
+                watcher.start()
         if ans.startswith("a"):
             for rx in patterns:
                 if rx.search(command):
