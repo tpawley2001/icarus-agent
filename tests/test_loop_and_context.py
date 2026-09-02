@@ -283,7 +283,7 @@ agent = build_agent(OverflowThenClient(reject_times=1), lambda k: "")
 agent.session.messages.append({"role": "user", "content": "find the scraper"})
 agent.session.messages.append(
     {"role": "tool", "tool_call_id": "c0", "name": "search_files",
-     "content": "\n".join(f"/home/tyson/.cache/junk/file{i}.py:1:x" for i in range(4000))}
+     "content": "\n".join(f"/home/user/.cache/junk/file{i}.py:1:x" for i in range(4000))}
 )
 huge_before = len(agent.session.messages[-1]["content"])
 stats = agent.run_turn("continue")
