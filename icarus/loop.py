@@ -37,6 +37,8 @@ Operating rules:
 - Prefer tools over speculation. If a fact is on disk or obtainable from a command, go get it rather than guessing.
 - You are running on a local model with a limited context window. Be concise. Do not restate long file contents back to the user; refer to paths and line numbers.
 - When a command fails, read the error and adapt. Do not repeat an identical failing call.
+- When searches establish that the requested file, symbol, or artifact is absent, report that
+  conclusion. Do not keep rephrasing the same search in hopes of a different result.
 - Destructive shell commands require the user's approval; if one is denied, do not try to route around it.
 - When the task is done, say so plainly and stop calling tools.
 
@@ -50,6 +52,14 @@ Today is {date}."""
 # identical call *more* likely, so the trace can only be broken from outside.
 MAX_IDENTICAL_REPEATS = 3
 
+# Different calls can still be the same dead end. In particular, small models
+# often vary a search pattern after every zero-hit result, which defeats the
+# exact call-signature guard above while adding no information to the turn.
+# Accept the first semantic result, then nudge on repeats and stop after this
+# many repeats. Advancing file pages are unaffected because their result bytes
+# differ and they are not classified as an empty discovery result.
+MAX_NO_PROGRESS_REPEATS = 3
+
 REPEAT_NUDGE = (
     "[icarus] You already made this exact call with these exact arguments, and "
     "the result is byte-for-byte identical to the one above. Repeating it "
@@ -57,6 +67,15 @@ REPEAT_NUDGE = (
     "somewhere you have not looked yet — or stop and tell the user what you "
     "found and what is blocking you."
 )
+
+NO_PROGRESS_NUDGE = (
+    "[icarus] This call used different arguments but produced no new information. "
+    "You have already seen the same result, or already established that searches "
+    "in this location return nothing. Treat that as evidence: choose a materially "
+    "different action, or stop and explain that the requested item was not found."
+)
+
+INTERRUPTED_MARKER = "[icarus turn interrupted by user; partial work was saved]"
 
 
 # A served prompt can overflow the window even after per-request compaction,
@@ -117,6 +136,35 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
+def _result_signature(
+    name: str,
+    content: str,
+    display: str = "",
+    arguments: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Fingerprint information rather than call syntax.
+
+    Zero-hit discovery tools deliberately share one signature per search root
+    even though their result text embeds the changing query. This is the
+    semantic loop seen when a model searches for ``*.py``, then ``python``,
+    then another spelling after one repository has already proved that no
+    Python exists. Different roots remain independent. Other results use their
+    exact bytes, allowing legitimate paging and reads of different files to
+    continue.
+    """
+    summary = (display or "").strip().lower()
+    body = (content or "").strip().lower()
+    if name in {"search_files", "glob_files"} and (
+        "0 hit" in summary
+        or summary.endswith(": 0")
+        or body.startswith("no matches for ")
+        or body.startswith("no files match ")
+    ):
+        root = str((arguments or {}).get("path") or ".").rstrip("/") or "/"
+        return f"discovery:no-matches:{root}"
+    return "bytes:" + _digest(content or "")
+
+
 @dataclass
 class TurnStats:
     iterations: int = 0
@@ -128,6 +176,7 @@ class TurnStats:
     interrupted: bool = False
     steered: int = 0
     repeated_calls: int = 0
+    no_progress_calls: int = 0
     looped: bool = False
 
 
@@ -167,6 +216,45 @@ class Agent:
             self.todo_ref.extend(new.todos)
             new.todos = self.todo_ref
         self.session = new
+
+    def checkpoint_interrupted_turn(self) -> None:
+        """Make a Ctrl-C'd turn durable and valid for a later resume.
+
+        SIGINT can land after an assistant tool-call message is appended but
+        before dispatch returns. Chat-completions APIs require every such call
+        to have a tool response, so fill any dangling pairs before writing the
+        session. The marker makes the operation idempotent if cleanup is called
+        more than once.
+        """
+        if (self.session.messages
+                and self.session.messages[-1].get("content") == INTERRUPTED_MARKER):
+            self.session.save()
+            return
+
+        pending: Dict[str, str] = {}
+        for message in self.session.messages:
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    fn = call.get("function") or {}
+                    call_id = str(call.get("id") or "")
+                    if call_id:
+                        pending[call_id] = str(fn.get("name") or "")
+            elif message.get("role") == "tool":
+                pending.pop(str(message.get("tool_call_id") or ""), None)
+
+        for call_id, name in pending.items():
+            self.session.messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": "[interrupted by user before this tool call completed]",
+            })
+        self.session.messages.append(
+            {"role": "assistant", "content": INTERRUPTED_MARKER}
+        )
+        self.session.turns += 1
+        self.session.note_model(self.model)
+        self.session.save()
 
     # ---- prompt ---------------------------------------------------------
     def system_prompt(self) -> str:
@@ -328,7 +416,9 @@ class Agent:
         # Scoped to the turn: repeating a lookup in a later turn is legitimate,
         # since the file or directory may well have changed by then.
         seen_calls: Dict[str, Tuple[str, int]] = {}
+        seen_results: Dict[str, int] = {}
         looping = False
+        loop_reason = "repeated tool call"
 
         for _ in range(max_iter):
             stats.iterations += 1
@@ -473,6 +563,7 @@ class Agent:
                     continue
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
+
                 raw_args = fn.get("arguments") or "{}"
                 try:
                     shown = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -510,6 +601,35 @@ class Agent:
                             )
                     continue
 
+                # Catch a broader attractor: changed arguments that lead back
+                # to information the turn already has. Empty search/glob
+                # results are normalized by _result_signature so query churn
+                # cannot evade this guard.
+                tool = self.registry.get(name)
+                track_no_progress = not (tool and tool.mutates)
+                result_sig = _result_signature(
+                    name,
+                    result.content,
+                    result.display,
+                    shown if isinstance(shown, dict) else None,
+                )
+                result_repeats = seen_results.get(result_sig, 0)
+                if track_no_progress:
+                    seen_results[result_sig] = result_repeats + 1
+                if track_no_progress and result_repeats:
+                    stats.no_progress_calls += 1
+                    self.session.messages.append(
+                        {"role": "tool", "tool_call_id": call.get("id", ""),
+                         "name": name, "content": NO_PROGRESS_NUDGE}
+                    )
+                    if result_repeats >= MAX_NO_PROGRESS_REPEATS:
+                        looping = True
+                        loop_reason = "tool calls kept producing no new information"
+                        stats.looped = True
+                        if self.on_status:
+                            self.on_status("stopped: tool calls produced no new information")
+                    continue
+
                 self.session.messages.append(
                     {
                         "role": "tool",
@@ -524,9 +644,8 @@ class Agent:
 
             if looping:
                 self.session.messages.append(
-                    {"role": "assistant",
-                     "content": "[icarus stopped this turn: the same tool call kept "
-                                "returning identical results]"}
+                    {"role": "assistant", "content":
+                     f"[icarus stopped this turn: {loop_reason}]"}
                 )
                 break
         else:

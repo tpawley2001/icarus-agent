@@ -974,6 +974,7 @@ def repl(agent: Agent, console: Console) -> None:
         except KeyboardInterrupt:
             console.spinner.stop()
             console.end_stream()
+            agent.checkpoint_interrupted_turn()
             console.say(st.yellow("  interrupted"))
             continue
         finally:
@@ -1153,6 +1154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             agent.run_turn(oneshot)
         except KeyboardInterrupt:
+            agent.checkpoint_interrupted_turn()
             return 130
         finally:
             console.spinner.stop()

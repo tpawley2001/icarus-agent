@@ -42,6 +42,9 @@ from icarus.context import (  # noqa: E402
 from icarus.llm import LLMError, Reply  # noqa: E402
 from icarus.loop import (  # noqa: E402
     MAX_IDENTICAL_REPEATS,
+    MAX_NO_PROGRESS_REPEATS,
+    INTERRUPTED_MARKER,
+    NO_PROGRESS_NUDGE,
     REPEAT_NUDGE,
     Agent,
     _is_context_overflow,
@@ -101,12 +104,72 @@ class PagingClient(LoopingClient):
         return self._call({"path": "/repo/app.py", "offset": self.calls * 100})
 
 
+class SemanticLoopClient(LoopingClient):
+    """Changes its query every time, but every query proves the same absence."""
+
+    def complete(self, model, messages, **kw):  # noqa: ANN001
+        self.calls += 1
+        return Reply(
+            content="",
+            tool_calls=[{
+                "id": f"s{self.calls}",
+                "function": {
+                    "name": "search_files",
+                    "arguments": json.dumps({
+                        "path": "/repo",
+                        "pattern": ["\\.py$", "python", "def ", "import "][
+                            (self.calls - 1) % 4
+                        ] + str(self.calls),
+                    }),
+                },
+            }],
+            prompt_tokens=100,
+            completion_tokens=10,
+        )
+
+
+class MutatingClient(LoopingClient):
+    """Makes distinct state-changing calls whose terse results happen to match."""
+
+    def complete(self, model, messages, **kw):  # noqa: ANN001
+        if self.calls >= 5:
+            return Reply(content="done", prompt_tokens=100, completion_tokens=10)
+        self.calls += 1
+        return Reply(
+            content="",
+            tool_calls=[{
+                "id": f"m{self.calls}",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps({"path": f"file-{self.calls}.txt"}),
+                },
+            }],
+            prompt_tokens=100,
+            completion_tokens=10,
+        )
+
+
 def build_agent(client, tool_content, ctx: int = 32768, max_iterations: int = 20) -> Agent:
     reg = Registry()
 
     @reg.tool("read_file", "read a file", {"type": "object", "properties": {}})
     def _read(**kwargs):
         return ToolResult(True, tool_content(kwargs))
+
+    @reg.tool("search_files", "search files", {"type": "object", "properties": {}})
+    def _search(**kwargs):
+        out = tool_content(kwargs)
+        if isinstance(out, ToolResult):
+            return out
+        return ToolResult(True, out)
+
+    @reg.tool("write_file", "write a file", {"type": "object", "properties": {}},
+              mutates=True)
+    def _write(**kwargs):
+        out = tool_content(kwargs)
+        if isinstance(out, ToolResult):
+            return out
+        return ToolResult(True, out)
 
     return Agent(
         client=client,
@@ -163,6 +226,64 @@ a3 = build_agent(LoopingClient(), lambda a: f"content v{next(counter)}")
 s3 = a3.run_turn("watch the file")
 check("not treated as a loop", s3.looped is False)
 check("no repeats counted", s3.repeated_calls == 0, f"got {s3.repeated_calls}")
+
+section("[3b] changed searches with the same empty outcome are stopped")
+semantic = SemanticLoopClient()
+a3b = build_agent(
+    semantic,
+    lambda a: ToolResult(
+        True,
+        f"No matches for {a.get('pattern')!r} under /repo.",
+        "search_files: 0 hits",
+    ),
+)
+s3b = a3b.run_turn("find the Python implementation")
+check("semantic search loop stopped before the iteration cap",
+      s3b.iterations <= MAX_NO_PROGRESS_REPEATS + 2,
+      f"iterations={s3b.iterations}")
+check("semantic loop sets stats.looped", s3b.looped is True)
+check("changed arguments were not counted as identical calls",
+      s3b.repeated_calls == 0, f"got {s3b.repeated_calls}")
+check("no-progress calls were counted",
+      s3b.no_progress_calls == MAX_NO_PROGRESS_REPEATS,
+      f"got {s3b.no_progress_calls}")
+check("the semantic nudge replaced repeated empty results",
+      sum(1 for m in a3b.session.messages if m.get("content") == NO_PROGRESS_NUDGE)
+      == MAX_NO_PROGRESS_REPEATS)
+check("the closing message explains the broader stop",
+      "no new information" in str(a3b.session.messages[-1].get("content")))
+
+mutating = build_agent(MutatingClient(), lambda a: "ok")
+s3b_mutating = mutating.run_turn("create five files")
+check("matching results from distinct mutating calls count as progress",
+      not s3b_mutating.looped and s3b_mutating.no_progress_calls == 0)
+check("mutating sequence reached its normal answer",
+      mutating.session.messages[-1].get("content") == "done")
+
+section("[3c] Ctrl-C checkpoints a structurally valid, resumable turn")
+interrupted = build_agent(LoopingClient(), lambda a: "unused")
+interrupted.session.messages.extend([
+    {"role": "user", "content": "inspect it"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "done", "function": {"name": "read_file", "arguments": "{}"}},
+        {"id": "pending", "function": {"name": "read_file", "arguments": "{}"}},
+    ]},
+    {"role": "tool", "tool_call_id": "done", "name": "read_file", "content": "ok"},
+])
+interrupted.checkpoint_interrupted_turn()
+reloaded = Session.load(interrupted.session.id)
+check("interrupted session was written immediately", reloaded is not None)
+saved = reloaded.messages if reloaded else []
+check("dangling tool call received an interruption result",
+      any(m.get("role") == "tool" and m.get("tool_call_id") == "pending"
+          and "interrupted" in str(m.get("content")) for m in saved))
+check("checkpoint includes an explicit interruption marker",
+      saved[-1].get("content") == INTERRUPTED_MARKER if saved else False)
+check("checkpoint counts the interrupted turn", bool(reloaded and reloaded.turns == 1))
+before = len(saved)
+interrupted.checkpoint_interrupted_turn()
+check("checkpointing twice is idempotent",
+      len(interrupted.session.messages) == before and interrupted.session.turns == 1)
 
 # --------------------------------------------------------------------------
 section("[4] compact() never mutates the caller's history")
