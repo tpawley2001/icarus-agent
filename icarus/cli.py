@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import caps as caps_mod
+from . import complete as completion
 from . import config, ctxplan, detect as detect_mod, protocol, skillhub, skills as skills_mod
 from .gguf import shape_of
 from .interrupt import InputWatcher, NullWatcher
@@ -287,6 +288,11 @@ While the model is working
   type + Enter           queue a message; injected at the next step
   Esc                    interrupt the turn now
 """.strip()
+
+# Read back out of HELP rather than kept as a second list that drifts from it.
+SLASH_COMMANDS = tuple(sorted({
+    m.group(1) for m in re.finditer(r"^\s+(/[a-z]+)", HELP, re.M)
+}))
 
 
 def cmd_models(agent: Agent, console: Console) -> None:
@@ -937,6 +943,11 @@ def repl(agent: Agent, console: Console) -> None:
         readline.set_history_length(2000)
     except ImportError:
         hist = None
+
+    # Tab completes paths and slash commands. Relative paths resolve against
+    # agent.workdir, which /cwd moves independently of the process's own cwd,
+    # so what Tab offers is what the tools will actually open.
+    completion.install(SLASH_COMMANDS, base=lambda: str(agent.workdir))
 
     console.say(st.cyan(BANNER))
     console.say(st.grey("  a fully local agent · nothing leaves this machine\n"))

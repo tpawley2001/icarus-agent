@@ -206,6 +206,20 @@ and recorded in `ctx_overrides.json` beside it. `gen_config.py` reads that
 sidecar, so a resize survives a regeneration; `/ctx reset` restores the original
 value immediately rather than waiting for one.
 
+## At the prompt
+
+Arrow keys, `^A`/`^E` and `^R` come from readline, and history persists in
+`~/.icarus/history`.
+
+**Tab completes paths and commands**, anywhere in the line — `read src/ma⇥`
+becomes `read src/main.py`. Directories complete to a trailing `/` with no
+space after, so Tab again walks straight into them. `~/` stays written as `~/`
+instead of expanding, spaces in filenames are escaped for you, and relative
+paths resolve against `/cwd` — the agent's working directory — so what Tab
+offers is what the tools will open. At the start of a line, `/` is a command
+first: `/mod⇥` gives `/model`, not `/mnt/`, and falls back to an absolute path
+when no command matches.
+
 ## Interrupting and steering a running turn
 
 A turn is not a dead end. While the model streams or a tool runs:
@@ -364,6 +378,7 @@ icarus/
   llm.py        chat completions over stdlib urllib; SSE streaming
   caps.py       per-model capability probe, cached to disk
   protocol.py   text tool-call protocol + multi-family leak parser
+  complete.py   Tab completion for paths and slash commands
   context.py    token budgeting, calibration, compaction
   session.py    persistence and resume
   interrupt.py  raw-mode type-ahead + Esc, pinned input line
