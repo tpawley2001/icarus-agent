@@ -330,12 +330,19 @@ model:
   default: ''                        # blank = follow whatever llama-swap has resident
   base_url: http://127.0.0.1:9292/v1
   temperature: 0.2
+  max_tokens: 8192                   # the whole reply budget, file writes included
 agent:
   max_iterations: 40
   context_threshold: 0.75            # compact at 75% of usable context
 llama_swap:
   unload_before_switch: true
 ```
+
+`max_tokens` is worth knowing about: a `write_file` call carries its content
+inside the reply, so the budget caps how large a file the model can write in one
+call. Past the cap the call is cut off mid-JSON and nothing is written. Icarus
+tells the model exactly that and asks it to write the file in pieces, but a
+bigger budget means fewer round trips.
 
 Env overrides: `ICARUS_BASE_URL`, `ICARUS_MODEL`, `ICARUS_HOME`.
 

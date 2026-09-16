@@ -40,6 +40,7 @@ Operating rules:
 - When searches establish that the requested file, symbol, or artifact is absent, report that
   conclusion. Do not keep rephrasing the same search in hopes of a different result.
 - Destructive shell commands require the user's approval; if one is denied, do not try to route around it.
+- One tool call cannot carry more output than the model's reply budget. Write a long file in pieces: write_file the first section, then edit_file or append the rest. A call whose arguments run past the budget is cut off mid-string and is lost entirely.
 - When the task is done, say so plainly and stop calling tools.
 
 Working directory: {workdir}
@@ -73,6 +74,20 @@ NO_PROGRESS_NUDGE = (
     "You have already seen the same result, or already established that searches "
     "in this location return nothing. Treat that as evidence: choose a materially "
     "different action, or stop and explain that the requested item was not found."
+)
+
+# How many truncated tool calls to absorb before abandoning the turn. A model
+# that cannot fit the file it wants to write will not learn to split it after
+# three tries, and every attempt costs a full reply budget.
+MAX_BAD_ARG_CALLS = 2
+
+TRUNCATED_ARGS_NUDGE = (
+    "[icarus] That {name} call never ran. Its arguments were cut off mid-JSON at "
+    "{chars} characters, which means the content you were writing hit the reply "
+    "budget before it finished. Nothing was written and nothing was saved. Do not "
+    "retry the same call — it will be cut at the same place. Split the work: write "
+    "the first part of the file with write_file, then add each further part with a "
+    "separate edit_file or write_file call."
 )
 
 INTERRUPTED_MARKER = "[icarus turn interrupted by user; partial work was saved]"
@@ -177,6 +192,7 @@ class TurnStats:
     steered: int = 0
     repeated_calls: int = 0
     no_progress_calls: int = 0
+    bad_arg_calls: int = 0
     looped: bool = False
 
 
@@ -417,6 +433,7 @@ class Agent:
         # since the file or directory may well have changed by then.
         seen_calls: Dict[str, Tuple[str, int]] = {}
         seen_results: Dict[str, int] = {}
+        bad_args_seen = 0
         looping = False
         loop_reason = "repeated tool call"
 
@@ -533,12 +550,25 @@ class Agent:
             if content and not stream and self.on_text:
                 self.on_text(content)
 
+            # Store nothing the server cannot render back to us. llama.cpp
+            # parses every stored tool_call's arguments when building the next
+            # prompt, so one truncated call would otherwise poison the session
+            # permanently — every later request 500s before generating a token,
+            # including the one that would have explained the problem.
+            broken_args = {id(c): raw for c, raw in protocol.sanitize_arguments(calls)}
+
             assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
             if calls:
                 assistant_msg["tool_calls"] = calls
             self.session.messages.append(assistant_msg)
 
             if not calls:
+                if reply.finish_reason == "length" and self.on_status:
+                    # Otherwise a half-finished answer just looks like a bad one.
+                    self.on_status(
+                        "reply stopped at the max_tokens cap — it is cut off, not "
+                        "finished; raise model.max_tokens or ask for less at once"
+                    )
                 break
 
             for call in calls:
@@ -563,6 +593,34 @@ class Agent:
                     continue
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
+
+                raw_broken = broken_args.get(id(call))
+                if raw_broken is not None:
+                    bad_args_seen += 1
+                    stats.bad_arg_calls += 1
+                    self.session.messages.append(
+                        {"role": "tool", "tool_call_id": call.get("id", ""),
+                         "name": name,
+                         "content": TRUNCATED_ARGS_NUDGE.format(
+                             name=name or "tool", chars=len(raw_broken))}
+                    )
+                    if self.on_status:
+                        self.on_status(
+                            f"{name or 'tool'} call was cut off mid-JSON at "
+                            f"{len(raw_broken)} chars — nothing ran; asking for "
+                            f"smaller pieces"
+                        )
+                    if bad_args_seen >= MAX_BAD_ARG_CALLS:
+                        looping = True
+                        loop_reason = "tool-call arguments kept being truncated"
+                        stats.looped = True
+                        if self.on_status:
+                            self.on_status(
+                                "stopped: the model keeps trying to write more in "
+                                "one call than the reply budget allows — raise "
+                                "model.max_tokens or ask for smaller files"
+                            )
+                    continue
 
                 raw_args = fn.get("arguments") or "{}"
                 try:

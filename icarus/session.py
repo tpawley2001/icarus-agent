@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import config
+from . import config, protocol
 
 
 @dataclass
@@ -61,9 +61,15 @@ class Session:
                 return None
             p = matches[0]
         try:
-            return cls(**json.loads(p.read_text()))
+            s = cls(**json.loads(p.read_text()))
         except Exception:
             return None
+        # A tool call with unparseable arguments makes llama.cpp refuse to
+        # render the whole prompt, so a session saved with one can never be
+        # resumed until it is neutralised. Repair it on the way in.
+        if protocol.repair_history(s.messages):
+            s.save()
+        return s
 
     @classmethod
     def latest(cls) -> Optional["Session"]:

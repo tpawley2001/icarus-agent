@@ -41,6 +41,7 @@ from icarus.context import (  # noqa: E402
 )
 from icarus.llm import LLMError, Reply  # noqa: E402
 from icarus.loop import (  # noqa: E402
+    MAX_BAD_ARG_CALLS,
     MAX_IDENTICAL_REPEATS,
     MAX_NO_PROGRESS_REPEATS,
     INTERRUPTED_MARKER,
@@ -50,6 +51,7 @@ from icarus.loop import (  # noqa: E402
     _is_context_overflow,
     _is_dead_model,
 )
+from icarus import protocol  # noqa: E402
 from icarus.session import Session  # noqa: E402
 from icarus.tools.registry import Registry, ToolResult  # noqa: E402
 
@@ -507,6 +509,98 @@ check("the raw upstream body is preserved for debugging",
       "exited prematurely" in recorded)
 check("it does not hammer the dead upstream", client.calls <= 2,
       f"{client.calls} calls")
+
+
+section("[11] a tool call truncated mid-JSON cannot poison the session")
+
+# From a real session: the model wrote a 318-field types.py in one write_file,
+# generation hit max_tokens at 16,573 characters, and the arguments stopped
+# mid-string. llama.cpp parses stored tool_call arguments while RENDERING the
+# next prompt, so from then on EVERY request died with the identical
+# `HTTP 500 ... Failed to parse tool call arguments as JSON` — before a single
+# token was generated. The conversation could not be rescued from the inside,
+# because the message asking the model to retry was itself unrenderable.
+TRUNCATED = '{"path":"/tmp/types.py","content":"class User:\\n    def __init__(self, id:'
+
+
+class TruncatedWriteClient:
+    """Emits a write_file whose arguments were cut off by the token cap."""
+
+    def __init__(self) -> None:
+        self.disable_thinking = False
+        self.calls = 0
+        self.sent = []
+
+    def complete(self, model, messages, **kw):  # noqa: ANN001
+        self.calls += 1
+        self.sent.append([dict(m) for m in messages])
+        return Reply(
+            content="",
+            tool_calls=[{
+                "id": f"w{self.calls}",
+                "function": {"name": "write_file", "arguments": TRUNCATED},
+            }],
+            finish_reason="length",
+            prompt_tokens=100,
+            completion_tokens=8192,
+        )
+
+
+client = TruncatedWriteClient()
+agent = build_agent(client, lambda k: "")
+stats = agent.run_turn("convert the repo to python")
+
+stored = [m for m in agent.session.messages if m.get("role") == "assistant"]
+bad = []
+for m in stored:
+    for c in m.get("tool_calls") or []:
+        try:
+            json.loads(c["function"]["arguments"])
+        except json.JSONDecodeError:
+            bad.append(c)
+check("no unparseable arguments are stored in history", not bad, f"{len(bad)} bad")
+check("every message sent upstream is renderable", all(
+    json.loads(c["function"]["arguments"]) is not None
+    for msgs in client.sent for m in msgs for c in (m.get("tool_calls") or [])
+))
+nudge = [m for m in agent.session.messages
+         if m.get("role") == "tool" and "cut off mid-JSON" in str(m.get("content"))]
+check("the model is told the call never ran", nudge)
+check("the nudge names the real cause, not 'invalid JSON'",
+      "reply budget" in str(nudge[0]["content"]) if nudge else False)
+check("it is told to split the write, not retry",
+      "Do not retry" in str(nudge[0]["content"]) if nudge else False)
+check("the truncation is counted", stats.bad_arg_calls >= 1)
+check("the turn stops instead of burning the iteration cap",
+      stats.looped and client.calls <= MAX_BAD_ARG_CALLS + 1,
+      f"{client.calls} calls, looped={stats.looped}")
+
+
+section("[12] a session already wedged by a truncated call is repaired on load")
+
+wedged = Session(id="wedged00", model="m", workdir="/tmp")
+wedged.messages = [
+    {"role": "user", "content": "convert it"},
+    {"role": "assistant", "content": "",
+     "tool_calls": [{"id": "w1",
+                     "function": {"name": "write_file", "arguments": TRUNCATED}}]},
+    {"role": "tool", "tool_call_id": "w1", "name": "write_file", "content": "bad json"},
+]
+wedged.save()
+
+reloaded = Session.load("wedged00")
+check("the session still loads", reloaded is not None)
+args = reloaded.messages[1]["tool_calls"][0]["function"]["arguments"]
+check("the poisoned call is neutralised", json.loads(args) == {})
+check("the rest of the history survives",
+      len(reloaded.messages) == 3 and reloaded.messages[0]["content"] == "convert it")
+check("the repair is persisted, not redone every load",
+      protocol.repair_history(json.loads(wedged.path.read_text())["messages"]) == 0)
+check("a clean history is left alone",
+      protocol.repair_history([
+          {"role": "assistant", "tool_calls": [
+              {"id": "a", "function": {"name": "read_file",
+                                       "arguments": '{"path":"/x"}'}}]}]) == 0)
 
 
 # --------------------------------------------------------------------------

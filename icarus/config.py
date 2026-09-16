@@ -35,7 +35,9 @@ DEFAULTS: Dict[str, Any] = {
         "api_key": "not-needed",
         "temperature": 0.2,
         "top_p": 0.95,
-        "max_tokens": 4096,
+        # A file write travels inside the reply budget, so 4096 could not carry
+        # even a 300-line source file — the call was truncated mid-JSON and lost.
+        "max_tokens": 8192,
         # Reasoning models served with --jinja return EMPTY content unless
         # thinking is explicitly disabled. On by default; see llm.py.
         "disable_thinking": True,

@@ -175,3 +175,61 @@ def parse(content: str) -> Tuple[str, List[Dict[str, Any]]]:
             pass
 
     return content.strip(), []
+
+
+# --- malformed-argument quarantine ---------------------------------------
+#
+# A tool call whose `arguments` string is not valid JSON is not merely a failed
+# call. llama.cpp parses the arguments of every assistant tool_call while
+# RENDERING the prompt, so a single malformed call stored in history makes every
+# later request fail with `HTTP 500 ... Failed to parse tool call arguments as
+# JSON` before a token is generated. The conversation is then unrecoverable from
+# the inside: the request carrying "that write got cut off, try again" is itself
+# unrenderable, so the model never sees it and the agent reports the identical
+# error forever.
+#
+# Truncated arguments happen for real — a write_file whose content runs past
+# max_tokens simply stops mid-string — so the fix belongs where the call is
+# STORED, not where it is dispatched.
+
+
+def sanitize_arguments(
+    calls: List[Dict[str, Any]]
+) -> List[Tuple[Dict[str, Any], str]]:
+    """Replace unparseable ``arguments`` with ``{}`` in place.
+
+    Returns ``[(call, original_arguments)]`` for every call it neutralised, so
+    the caller can tell the model what happened to that specific call.
+    """
+    broken: List[Tuple[Dict[str, Any], str]] = []
+    for call in calls or []:
+        fn = call.get("function")
+        if not isinstance(fn, dict):
+            continue
+        raw = fn.get("arguments")
+        if not isinstance(raw, str):
+            continue
+        if not raw.strip():
+            fn["arguments"] = "{}"
+            continue
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError:
+            broken.append((call, raw))
+            fn["arguments"] = "{}"
+    return broken
+
+
+def repair_history(messages: List[Dict[str, Any]]) -> int:
+    """Neutralise malformed tool calls in a session loaded from disk.
+
+    Sessions written before the quarantine existed are permanently wedged —
+    every turn dies on the same render error. Repairing on load makes them
+    resumable again. Returns how many calls were fixed.
+    """
+    fixed = 0
+    for m in messages or []:
+        if m.get("role") != "assistant":
+            continue
+        fixed += len(sanitize_arguments(m.get("tool_calls") or []))
+    return fixed
